@@ -1,29 +1,29 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
-extern void _dump_stack();
-extern void _restore_stack();
+//extern void _dump_stack();
+//extern void _restore_stack();
 
-#define dp_stack() \
-	asm("in r16,0x3d");\
-	asm("in r17,0x3e");\
-	asm("sts 0x0060,r16");\
-	asm("sts 0x0061,r17");\
+#define DUMP_STACK() \
+	asm("in r16,0x3d"); \
+	asm("in r17,0x3e"); \
+	asm("sts 0x0060,r16"); \
+	asm("sts 0x0061,r17")
 
-static inline void dump_stack()
+#define RESTORE_STACK() \
+	asm("lds r16,0x0060"); \
+	asm("lds r17,0x0061"); \
+	asm("out 0x3d,r16"); \
+	asm("out 0x3e,r17")
+	
+void dump_stack()
 {
-	asm("in r16,0x3d");
-	asm("in r17,0x3e");
-	asm("sts 0x0060,r16");
-	asm("sts 0x0061,r17");
+	DUMP_STACK();
 }
 
-static inline void restore_stack()
+void restore_stack()
 {
-	asm("lds r16,0x0060");
-	asm("lds r17,0x0061");
-	asm("out 0x3d,r16");
-	asm("out 0x3e,r17");
+	RESTORE_STACK();
 }
 
 struct process_s
@@ -58,77 +58,82 @@ struct process_s* get_next()
 
 void do_schedule()
 {
-	// dump current stack pointer
-	asm("in r16,0x3d");
-	asm("in r17,0x3e");
-	asm("sts 0x0060,r16");
-	asm("sts 0x0061,r17");
-	// copy dump to process related struct
-	memcpy(&current->tss, &current_tss, sizeof(current_tss));
-	
 	struct process_s *next = get_next();
 	
 	//if (current != next)
 	{
+		DUMP_STACK();
+		current->tss = current_tss;
+		
 		// switch process
 		current = next;
 		
-		// load dump from process struct
-		memcpy(&current_tss, &current->tss, sizeof(current_tss));
-		// restore current stack SP only		
-		asm("lds r16,0x0060");
-		asm("lds r17,0x0061");
-		asm("out 0x3d,r16");
-		asm("out 0x3e,r17");
+		// load process context
+		current_tss = current->tss;
+		RESTORE_STACK();
 	}
+	
+	sei();
 }
 
 typedef void (*user_main)();
 
 extern void userland();
 
+void do_exit()
+{
+	current->state = TASK_ZOMBIE;
+	do_schedule();
+}
+
 void do_fork(struct process_s *process, user_main main)
 {
+	// setup stack of new process
+	asm("ldi r16,0xff");
+	asm("ldi r17,0x00");
+	asm("out 0x3d,r16");
+	asm("out 0x3e,r17");
+	
 	current = process;
 	
 	process->pid = 0;
 	process->state = TASK_RUNNABLE;
 
 	main();
+	
+	do_exit();
 }
 
 void do_idle()
 {
 	current = processes;
 	current->pid = -1;
+
+	// dump stack pointer
+	do_schedule();
 	
+	// enable global interrupts
+	sei();
+
 	while (1)
 	{
-	
-		// begin with do schedule to set tss
-		do_schedule();
-		
 		struct process_s *user = processes + 1;
-
+		
+		// disable interrupts
+		cli();
+		
 		if (user->state == TASK_ZOMBIE)
 		{
-			do_fork(processes + 1, &userland);
+			do_fork(user, &userland);
 		}
-
-		// wakeup user
-		user->state = TASK_RUNNABLE;
+		
+		do_schedule();
 	}
-}
-
-void sys_fork(struct process_s *process, uint16_t *address)
-{
-	cli();
-	do_fork(process, address);
-	sei();
 }
 
 void sys_wait(long const sleep)
 {
+	cli();
 	current->state = TASK_INTERRUPTIBLE;
 	do_schedule();
 }
@@ -141,37 +146,31 @@ int main(void)
 	
 	// setup timer
 	// checkout https://www.mikrocontroller.net/articles/AVR-GCC-Tutorial/Die_Timer_und_Z%C3%A4hler_des_AVR
-	//TCCR0 = (0 << CS02 | 1 << CS01 | 0 << CS00);
-	//TIMSK |= (1 << TOIE0); // enable overflow interrupt
+	TCCR0 = (0 << CS02 | 1 << CS01 | 0 << CS00);
+	TIMSK |= (1 << TOIE0); // enable overflow interrupt
 
-	//sei(); // enable global interrupt
-	
 	// idle process will schedule userland process
 	do_idle();
 }
 
 void userland()
 {
-	// setup stack of new process
-	asm("ldi r16,0xff");
-	asm("ldi r17,0x00");
-	asm("out 0x3d,r16");
-	asm("out 0x3e,r17");
+	int i;
 	
-	while (1)
+	for (i = 0; i < 10; i++)
 	{
-		// set state to TASK_INTERRUPTIBLE
-		// this will invoke idle process
-		// which will set state to TASK_RUNNING
 		sys_wait(0);
 	}
-	
-	// sys_exit() must be called in case of termination
-	// for now we know user_main is never returning
 }
 
 ISR(TIMER0_OVF_vect, ISR_NAKED)
 {
+	struct process_s *user = processes + 1;
+	
+	if (user->state == TASK_INTERRUPTIBLE)
+	{
+		user->state = TASK_RUNNABLE;
+	}
 	
 	reti();
 }
